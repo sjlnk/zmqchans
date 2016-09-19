@@ -9,7 +9,16 @@ Documentation under construction.
 
 ## Usage
 
-FIXME
+```clojure
+(require '[zmqchans.core :refer [socket]])
+(require '[clojure.core.async :refer [>!! <!!]])
+
+(let [rep (socket :rep :bind "inproc://testing")
+      req (socket :req :connect "inproc://testing")]
+  (>!! (req :in) ["foo" "bar" (.getBytes "baz")])
+  (<!! (rep :out))
+)
+```
 
 ## License
 
