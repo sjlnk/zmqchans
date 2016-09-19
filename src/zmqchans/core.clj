@@ -22,10 +22,17 @@
    :pull   ZMQ/PULL
    :push   ZMQ/PUSH})
 
-(def ^:dynamic *print-stderr* true)
+(def ^:dynamic *print-stderr* (not (System/getProperty "zmqchans.quiet")))
 
-(defn error [fmt & args]
-  (binding [*out* *err*] (print (apply format (str fmt "\n") args))))
+(defmacro error [fmt & args]
+  (when *print-stderr*
+    `(binding [*out* *err*] (println (format ~fmt ~@args)))))
+
+(def ^:dynamic *print-trace* (System/getProperty "zmqchans.trace"))
+
+(defmacro trace [fmt & args]
+  (when *print-trace*
+    `(println (format ~fmt ~@args))))
 
 (defn send!
   [^ZMQ$Socket sock msg]
@@ -92,13 +99,13 @@
             
             [[:register sock-id new-sock chan-map]]
             (do
-              (println "zmq-poller: registered " sock-id)
+              (trace "zmq-poller: registered %s" sock-id)
               (recur (assoc socks sock-id new-sock)
                      (assoc chans sock-id chan-map)))
 
             [[:close sock-id]]
             (do
-              (println "zmq-poller: closing " sock-id)
+              (trace "zmq-poller: closing %s" sock-id)
               (.close (socks sock-id))
               (doseq [c (chans id)] (close! c))
               (recur (dissoc socks sock-id)
@@ -106,7 +113,7 @@
 
             [[:command sock-id cmd]]
             (do
-              (println "zmq-poller: commanding " sock-id)
+              (trace "zmq-poller: commanding %s" sock-id)
               (try
                 ;; Execute cmd with socket corresponding to sock-id and
                 ;; when return value is non-nil return it to async-control-chan
@@ -120,7 +127,7 @@
 
             [[sock-id msg-out]]
             (do
-              (println "zmq-poller: sending message to " sock-id)
+              (trace "zmq-poller: sending message to %s" sock-id)
               (try
                 (send! (socks sock-id) msg-out)
                 (catch Exception e
@@ -132,7 +139,7 @@
 
          [:injector :shutdown]
          (do
-           (println "zmq-poller: shutting down context...")
+           (trace "zmq-poller: shutting down context...")
            (doseq [sock (vals socks)] (.close sock))
            (doseq [c (->> (vals chans)
                           (map #(vals %))
@@ -143,14 +150,14 @@
 
          [sock-id msg-in]
          (do
-           (println "zmq-poller: incoming message on " sock-id)
+           (trace "zmq-poller: incoming message on %s" sock-id)
            (offer! (get-in chans [sock-id :out]) msg-in)
            (recur socks chans)
            )
          ))
       )
     )
-  (println "zmq-poller: terminated")
+  (trace "zmq-poller: terminated")
   )
 
 (defn- sock-id-for-chan
@@ -184,7 +191,7 @@
          (let [sock-id   (gen-id sock)
                in-chans  (select-keys chan-map #{:in :ctl-in})
                out-chans (select-keys chan-map #{:out :ctl-out})]
-           (println "injector: registering new socket " sock-id)
+           (trace "injector: registering new socket %s" sock-id)
            (inject-msg! [:register sock-id sock out-chans])
            (recur (assoc chans sock-id in-chans))
            )
@@ -192,7 +199,7 @@
          ;; Control channel closed => shut down context
          [:control nil]
          (do
-           (println "injector: shutting down context...")
+           (trace "injector: shutting down context...")
            (doseq [c in-chans] (close! c))
            (send! injector "shutdown")
            )
@@ -204,7 +211,7 @@
          ;; Channel closed => close socket
          [id nil]
          (do
-           (println "injector: closing " id)
+           (trace "injector: closing %s" id)
            (doseq [c (vals (get chans id))] (close! c))
            (inject-msg! [:close id])
            (recur (dissoc chans id))
@@ -212,7 +219,7 @@
 
          [id msg]
          (do
-           (println "injector: forwarding message to " id)
+           (trace "injector: forwarding message to %s" id)
            (cond
 
              ;; Normal message to deliver via socket.
@@ -231,7 +238,7 @@
         )
       )
     )
-  (println "injector: terminated")
+  (trace "injector: terminated")
   )
 
 (defn- init-context!
