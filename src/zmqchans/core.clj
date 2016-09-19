@@ -276,9 +276,38 @@
 ;; One io-thread should be sufficient almost always.
 (def default-context (context "default-context" 1))
 
+(def type-bytes (type (byte-array [])))
+
+(defn get-bytes [x]
+  (if (instance? type-bytes x) x (.getBytes x)))
+
 (defn gen-socket-configurator [opts]
   (fn [socket]
-    (let [{:keys [bind connect configurator]} opts]
+    (let [{:keys [bind connect plain-user plain-pass plain-server
+                  zap-domain req-retry id send-hwm recv-hwm]} opts]
+      (when id (.setIdentity socket (get-bytes id)))
+      (when zap-domain (.setZAPDomain (get-bytes zap-domain)))
+      (when (or plain-server plain-user plain-pass)
+        (if plain-server
+          (.setPlainServer socket plain-server)
+          (do
+            (assert (and plain-user plain-pass)
+                    "Specify both :plain-user and :plain-pass")
+            (.setPlainUsername socket (get-bytes plain-user))
+            (.setPlainPassword socket (get-bytes plain-pass))
+            ))
+        )
+      (when req-retry
+        (.setReqRelaxed socket req-retry)
+        (.setReqCorrelate socket req-retry))
+      ;; (when plain-user
+      ;;   (assert (and (coll? plain) (= (count plain) 2))
+      ;;           "Specify :plain-user in form [username password]")
+      ;;   (.setPlainUsername s (.getBytes (first plain)))
+      ;;   (.setPlainPassword s (.getBytes (second plain)))
+      ;;   )
+      (when send-hwm (.setSndHWM socket send-hwm))
+      (when recv-hwm (.setRcvHWM socket recv-hwm))
       (assert (or bind connect) "Specify :bind or :connect.")
       (when bind (.bind socket bind))
       (when connect (.connect socket connect))
