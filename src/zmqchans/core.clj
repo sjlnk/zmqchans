@@ -9,6 +9,7 @@
    [org.zeromq ZContext ZMQ ZMQ$Poller ZMQ$Socket]
    ))
 
+;; ZMQ_STREAM socket is not supported by jzmq as of v3.1
 (def ^:const socket-types
   {:pair   ZMQ/PAIR
    :pub    ZMQ/PUB
@@ -20,25 +21,30 @@
    :xpub   ZMQ/XPUB
    :xsub   ZMQ/XSUB
    :pull   ZMQ/PULL
-   :push   ZMQ/PUSH})
+   :push   ZMQ/PUSH
+   })
+
+;; Prevent overlapping lines printed from multiple threads.
+(def ^:private print-synchronizer (Object.))
 
 (def ^:dynamic *print-stderr* (not (System/getProperty "zmqchans.quiet")))
 
 (defmacro error [fmt & args]
   (when *print-stderr*
-    `(binding [*out* *err*] (println (format ~fmt ~@args)))))
+    `(locking print-synchronizer
+       (binding [*out* *err*] (println (format ~fmt ~@args))))))
 
 (def ^:dynamic *print-trace* (System/getProperty "zmqchans.trace"))
+;; (def ^:dynamic *print-trace* true)
 
 (defmacro trace [fmt & args]
   (when *print-trace*
-    `(println (format ~fmt ~@args))))
+    `(locking print-synchronizer (println (format ~fmt ~@args)))))
 
 (defn send!
   [^ZMQ$Socket sock msg]
   (let [msg (if (coll? msg) msg [msg])]
     (loop [[head & tail] msg]
-      ;;TODO: handle byte buffers.
       (let [res (.send sock head (if tail
                                    (bit-or ZMQ/NOBLOCK ZMQ/SNDMORE)
                                    ZMQ/NOBLOCK))]
@@ -67,8 +73,8 @@
         poller (ZMQ$Poller. n)]
     (doseq [s socks]
       (.register poller s ZMQ$Poller/POLLIN))
+    ;; (trace "polling %s socks" (.getSize poller))
     (.poll poller)
-
     ;; Randomly take the first ready socket and its message,
     ;; to match core.async's alts! behavior
     (->> (shuffle (range n))
@@ -82,12 +88,14 @@
 (defn- zmq-poller [zctx internal-addr internal-chan]
   (let [injector (doto (.createSocket zctx (socket-types :pull))
                    (.bind internal-addr))]
+    (trace "zmq-poller: %s started" (thread-name))
     (loop [socks {:injector injector}, chans {}]
       (let [[val sock] (poll (vals socks))
             id         (get (map-invert socks) sock)
             val        (if (= :injector id) (keyword (String. val)) val)
             ]
         (assert (and id val))
+        (trace "zmq-poller: got message from %s" id)
         (match
          [id val]
          
@@ -106,7 +114,12 @@
             [[:close sock-id]]
             (do
               (trace "zmq-poller: closing %s" sock-id)
-              (.close (socks sock-id))
+              ;; - Sets socket linger to zctx linger value (default 0).
+              ;; - Calls .close on socket.
+              ;; - Removes socket from zctx.
+              ;; - Should never block?
+              (.destroySocket zctx (socks sock-id))
+              ;; Close chans.
               (doseq [c (chans id)] (close! c))
               (recur (dissoc socks sock-id)
                      (dissoc chans sock-id)))
@@ -140,7 +153,16 @@
          [:injector :shutdown]
          (do
            (trace "zmq-poller: shutting down context...")
-           (doseq [sock (vals socks)] (.close sock))
+           ;; - Sets linger on all sockets to 0 (by default) and closes them.
+           ;; - Removes sockets from the context.
+           ;; - Terminates the underlying context.
+           ;; - If linger of zctx is > 0, may block if any sockets
+           ;;   (even closed) have pending operations.
+           ;; - Linger values on individual sockets are not respected.
+           ;;(doseq [s socks] (.destroySocket zctx s))
+           (.destroy zctx)
+           ;; Close chans.
+           (trace "zmq-poller: closing chans...")
            (doseq [c (->> (vals chans)
                           (map #(vals %))
                           flatten)] (close! c)))
@@ -177,6 +199,7 @@
                           (str (get (map-invert socket-types) (.getType sock)))
                           (vswap! sock-num inc)))
         ]
+    (trace "injector: %s started" (thread-name))
     (loop [chans {:control {:in ctl-chan}}]
       (let [in-chans (->> (vals chans)
                           (map #(vals %))
@@ -193,16 +216,14 @@
                out-chans (select-keys chan-map #{:out :ctl-out})]
            (trace "injector: registering new socket %s" sock-id)
            (inject-msg! [:register sock-id sock out-chans])
-           (recur (assoc chans sock-id in-chans))
-           )
+           (recur (assoc chans sock-id in-chans)))
 
          ;; Control channel closed => shut down context
          [:control nil]
          (do
            (trace "injector: shutting down context...")
            (doseq [c in-chans] (close! c))
-           (send! injector "shutdown")
-           )
+           (send! injector "shutdown"))
 
          [:control invalid]
          (throw (RuntimeException. (str "Invalid control message: " invalid)))
@@ -214,8 +235,7 @@
            (trace "injector: closing %s" id)
            (doseq [c (vals (get chans id))] (close! c))
            (inject-msg! [:close id])
-           (recur (dissoc chans id))
-           )
+           (recur (dissoc chans id)))
 
          [id msg]
          (do
@@ -233,52 +253,63 @@
              :else
              (throw (RuntimeException. "This should never happen."))
              )
-           (recur chans)
-           ))
-        )
-      )
-    )
-  (trace "injector: terminated")
-  )
+           (recur chans))))))
+  
+  (trace "injector: terminated"))
 
-(defn- init-context!
+(defn init-context!
   [ctx]
   (let [{:keys [zmq-thread injector-thread]} ctx]
-    (when-not (.isAlive zmq-thread) (.start zmq-thread))
-    (when-not (.isAlive injector-thread) (.start injector-thread)))
-  )
+    (if (.isAlive injector-thread)
+      false
+      (do
+        (.start injector-thread)
+        (.start zmq-thread)
+        true))))
 
 (defn context
+  "Create a context.
+  
+  Create a context for sockets that works on top of org.zeromq.ZContext.
+  When context is initialized (sockets created on top of it) it will be
+  automatically initialized (init-context!).
+
+  org.zeromq.ZContext is a wrapper for org.zeromq.ZMQ$Context. It is basically
+  org.zeromq.ZMQ$Context with lifetime logic built in. Sockets don't need to
+  be closed manually when using org.zeromq.ZContext.
+"
   ([] (context nil))
   ([name] (context name 1))
   ([name io-threads]
-   (let [injection-addr (str "inproc://injection-" (gensym (or name "")))
-         name (or name (gensym "context"))
-         zcontext (doto (ZContext.) (.setIoThreads io-threads))
-         internal-chan (chan)
-         ctl-chan (chan)
+   (let [injection-addr  (str "ipc://injection-" (gensym (or name "")))
+         name            (or name (gensym "context"))
+         zcontext        (doto (ZContext.)
+                           (.setIoThreads io-threads)
+                           (.setMain true) ; causes ZMQ$Context to term
+                           )
+         internal-chan   (chan)
+                         
+         ctl-chan        (chan) 
          injector-thread (doto (Thread.
                                 #(injector zcontext injection-addr
                                            internal-chan ctl-chan))
                            (.setName (format "injector-%s" name))
-                           (.setDaemon true)
-                           )
-         zmq-thread (doto (Thread.
-                           #(zmq-poller zcontext injection-addr
-                                        internal-chan))
+                           (.setDaemon true))
+         zmq-thread      (doto (Thread.
+                                #(zmq-poller zcontext injection-addr
+                                             internal-chan))
                            (.setName (format "zmq-poller-%s" name))
-                           (.setDaemon true)
-                           )
+                           (.setDaemon true))
+         shutdown        (fn [] (close! ctl-chan))
          ]
      {:zcontext        zcontext
       :name            name
       :ctl-chan        ctl-chan
       :addr            injection-addr
       :injector-thread injector-thread
-      :zmq-thread      zmq-thread}
-     )
-   )
-  )
+      :zmq-thread      zmq-thread
+      :shutdown        shutdown}
+     )))
 
 ;; One io-thread should be sufficient almost always.
 (def default-context (context "default-context" 1))
@@ -301,9 +332,7 @@
             (assert (and plain-user plain-pass)
                     "Specify both :plain-user and :plain-pass")
             (.setPlainUsername socket (get-bytes plain-user))
-            (.setPlainPassword socket (get-bytes plain-pass))
-            ))
-        )
+            (.setPlainPassword socket (get-bytes plain-pass)))))
       (when req-retry
         (.setReqRelaxed socket req-retry)
         (.setReqCorrelate socket req-retry))
@@ -317,9 +346,7 @@
       (when recv-hwm (.setRcvHWM socket recv-hwm))
       (assert (or bind connect) "Specify :bind or :connect.")
       (when bind (.bind socket bind))
-      (when connect (.connect socket connect))
-      ))
-  )
+      (when connect (.connect socket connect)))))
 
 (defn socket [socket-type & opts]
   (let [opts         (if (map? opts) opts (apply hash-map (apply vector opts)))
@@ -328,24 +355,21 @@
         out          (or (opts :out) (chan 1))
         ctl-in       (or (opts :ctl-in) (chan))
         ctl-out      (or (opts :ctl-out) (chan 1))
-        ctx          (try (doto (or (opts :context) default-context) init-context!)
-                          (catch java.lang.IllegalThreadStateException e
-                            (throw (IllegalArgumentException.
-                                    "Context is terminated"))))
-        socket       (.createSocket (ctx :zcontext) (socket-types socket-type))
-        ]
-    (assert (and in out ctl-in ctl-out) "missing channels")
-    (configurator socket)
-    (>!! (ctx :ctl-chan)
-         [:register socket {:in in :out out :ctl-in ctl-in :ctl-out ctl-out}])
-    {:in in :out out :ctl-in ctl-in :ctl-out ctl-out}
-    )
-  )
+        ctx          (or (opts :context) default-context)
+        initialized  (try (init-context! ctx)
+                                (catch java.lang.IllegalThreadStateException e
+                                  (throw (IllegalArgumentException.
+                                          "Context is terminated"))))]
+    (let [socket (.createSocket (ctx :zcontext) (socket-types socket-type))]
+      (assert (and in out ctl-in ctl-out) "missing channels")
+      (configurator socket)
+      (>!! (ctx :ctl-chan)
+           [:register socket {:in in :out out :ctl-in ctl-in :ctl-out ctl-out}])
+      {:in in :out out :ctl-in ctl-in :ctl-out ctl-out}
+      )))
 
 (comment
-  (let [sock (.createSocket (default-context :zcontext) ZMQ/DEALER)]
-    (.getType sock)
-    )
+  
   )
 
 
