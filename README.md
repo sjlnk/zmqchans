@@ -20,6 +20,18 @@ Documentation under construction.
 )
 ```
 
+## Troubleshooting
+
+### Assertion failed: written (/home/seb/src/libzmq/src/ctx.cpp:583) or something similar when shutting down context:
+
+This is a bug in libzmq, see https://github.com/zeromq/libzmq/issues/2117
+
+### Sockets using inproc transport randomly not delivering messages.
+
+This is really bad, will cause random malfunctions because zmqasync internally communicates via
+inproc sockets. Try updating libzmq. This problem occurred to me with libzmq 4.0.4. It may have
+been also due to version missmatch between jzmq and libzmq.
+
 ## License
 
 Copyright © 2016 Kevin Lynagh & Sebastian Jylanki
