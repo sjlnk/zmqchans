@@ -41,7 +41,7 @@
   (when *print-trace*
     `(locking print-synchronizer (println (format ~fmt ~@args)))))
 
-(defn send!
+(defn- send!
   [^ZMQ$Socket sock msg]
   (let [msg (if (coll? msg) msg [msg])]
     (loop [[head & tail] msg]
@@ -49,10 +49,12 @@
                                    (bit-or ZMQ/NOBLOCK ZMQ/SNDMORE)
                                    ZMQ/NOBLOCK))]
         (cond
-          (= false res) (error "*ERROR* message not sent on %s" sock)
+          (= false res)
+          (let [sock-type (str (get (map-invert socket-types) (.getType sock)))]
+            (error "*ERROR* message not sent on %s (%s)" sock sock-type))
           tail (recur tail))))))
 
-(defn receive-all
+(defn- receive-all
   "Receive all data parts from the socket, returning a vector of byte arrays.
   If the socket does not contain a multipart message, returns a plain byte array."
   [^ZMQ$Socket sock]
@@ -64,7 +66,7 @@
           (if (= 1 (count res))
             (first res) res))))))
 
-(defn poll
+(defn- poll
   "Blocking poll that returns a [val, socket] tuple.
   If multiple sockets are ready, one is chosen to be read from nondeterministically."
   [socks]
@@ -276,8 +278,7 @@
 
   org.zeromq.ZContext is a wrapper for org.zeromq.ZMQ$Context. It is basically
   org.zeromq.ZMQ$Context with lifetime logic built in. Sockets don't need to
-  be closed manually when using org.zeromq.ZContext.
-"
+  be closed manually when using org.zeromq.ZContext."
   ([] (context nil))
   ([name] (context name 1))
   ([name io-threads]
@@ -322,7 +323,8 @@
 (defn gen-socket-configurator [opts]
   (fn [socket]
     (let [{:keys [bind connect plain-user plain-pass plain-server
-                  zap-domain req-retry id send-hwm recv-hwm]} opts]
+                  zap-domain req-retry id send-hwm recv-hwm
+                  subscribe]} opts]
       (when id (.setIdentity socket (get-bytes id)))
       (when zap-domain (.setZAPDomain (get-bytes zap-domain)))
       (when (or plain-server plain-user plain-pass)
@@ -346,7 +348,8 @@
       (when recv-hwm (.setRcvHWM socket recv-hwm))
       (assert (or bind connect) "Specify :bind or :connect.")
       (when bind (.bind socket bind))
-      (when connect (.connect socket connect)))))
+      (when connect (.connect socket connect))
+      (when subscribe (.subscribe socket (get-bytes subscribe))))))
 
 (defn socket [socket-type & opts]
   (let [opts         (if (map? opts) opts (apply hash-map (apply vector opts)))
