@@ -1,12 +1,15 @@
 (ns zmqchans.core
+  (:use
+   [zmqchans.utils])
   (:require
-   [clojure.string :refer [split]]
+   [clojure.string :refer [split join]]
    [clojure.core.match :refer [match]]
    [clojure.set :refer [map-invert]]
    [clojure.core.async
-    :refer [chan  close! go thread <! >! <!! >!! alts!! timeout offer!]])
+    :refer [chan  close! go thread <! >! <!! >!! alts!! timeout offer!
+            promise-chan]])
   (:import
-   [org.zeromq ZContext ZMQ ZMQ$Poller ZMQ$Socket]
+   [org.zeromq ZMQ ZMQ$Poller ZMQ$Socket ZMQException]
    ))
 
 ;; ZMQ_STREAM socket is not supported by jzmq as of v3.1
@@ -35,7 +38,7 @@
        (binding [*out* *err*] (println (format ~fmt ~@args))))))
 
 (def ^:dynamic *print-trace* (System/getProperty "zmqchans.trace"))
-;; (def ^:dynamic *print-trace* true)
+;;(def ^:dynamic *print-trace* true)
 
 (defmacro trace [fmt & args]
   (when *print-trace*
@@ -45,12 +48,20 @@
   [^ZMQ$Socket sock msg]
   (let [msg (if (coll? msg) msg [msg])]
     (loop [[head & tail] msg]
-      (let [res (.send sock head (if tail
-                                   (bit-or ZMQ/NOBLOCK ZMQ/SNDMORE)
-                                   ZMQ/NOBLOCK))]
+      ;; Investigate whether error catching here is a good idea or whether
+      ;; the thread should be allowed to crash in an erroneous condition.
+      (let [res (try (.send sock head (if tail
+                                        (bit-or ZMQ/NOBLOCK ZMQ/SNDMORE)
+                                        ZMQ/NOBLOCK))
+                     (catch ZMQException e e))
+            ]
         (cond
+          (instance? Exception res)
+          (error "*ERROR* message not sent on %s: %s" sock res)
           (= false res)
-          (let [sock-type (str (get (map-invert socket-types) (.getType sock)))]
+          (let [sock-type (str (get (map-invert socket-types)
+                                    (try (.getType sock)
+                                         (catch ZMQException e nil))))]
             (error "*ERROR* message not sent on %s (%s)" sock sock-type))
           tail (recur tail))))))
 
@@ -87,111 +98,91 @@
 
 (defn- thread-name [] (.getName (Thread/currentThread)))
 
-(defn- zmq-poller [zctx internal-addr internal-chan]
-  (let [injector (doto (.createSocket zctx (socket-types :pull))
-                   (.bind internal-addr))]
-    (trace "zmq-poller: %s started" (thread-name))
-    (loop [socks {:injector injector}, chans {}]
-      (let [[val sock] (poll (vals socks))
-            id         (get (map-invert socks) sock)
-            val        (if (= :injector id) (keyword (String. val)) val)
-            ]
-        (assert (and id val))
-        (trace "zmq-poller: got message from %s" id)
-        (match
-         [id val]
+(defn- zmq-poller [injector internal-chan zmqt-term]
+  (trace "zmq-poller: %s started" (thread-name))
+  (loop [socks {:injector injector}, chans {}]
+    (let [[val sock] (poll (vals socks))
+          id         (get (map-invert socks) sock)
+          val        (if (= :injector id) (keyword (String. val)) val)]
+      (assert (and id val))
+      (trace "zmq-poller: got message from %s" id)
+      (match
+       [id val]
+       
+       [:injector :message]
+       (let [msg (<!! internal-chan)]
          
-         [:injector :message]
-         (let [msg (<!! internal-chan)]
-           
-           (match
-            [msg]
-            
-            [[:register sock-id new-sock chan-map]]
-            (do
-              (trace "zmq-poller: registered %s" sock-id)
-              (recur (assoc socks sock-id new-sock)
-                     (assoc chans sock-id chan-map)))
+         (match
+          [msg]
+          
+          [[:register sock-id new-sock chan-map]]
+          (do
+            (trace "zmq-poller: registered %s" sock-id)
+            (recur (assoc socks sock-id new-sock)
+                   (assoc chans sock-id chan-map)))
 
-            [[:close sock-id]]
-            (do
-              (trace "zmq-poller: closing %s" sock-id)
-              ;; - Sets socket linger to zctx linger value (default 0).
-              ;; - Calls .close on socket.
-              ;; - Removes socket from zctx.
-              ;; - Should never block?
-              (.destroySocket zctx (socks sock-id))
-              ;; Close chans.
-              (doseq [c (chans id)] (close! c))
-              (recur (dissoc socks sock-id)
-                     (dissoc chans sock-id)))
+          [[:close sock-id]]
+          (do
+            (trace "zmq-poller: closing %s" sock-id)
+            (.close (socks sock-id))
+            ;; Close chans.
+            (doseq [c (chans id)] (close! c))
+            (recur (dissoc socks sock-id)
+                   (dissoc chans sock-id)))
 
-            [[:command sock-id cmd]]
-            (do
-              (trace "zmq-poller: commanding %s" sock-id)
-              (try
-                ;; Execute cmd with socket corresponding to sock-id and
-                ;; when return value is non-nil return it to async-control-chan
-                ;; for further processing.
-                (when-let [res (cmd (socks sock-id))]
-                  (offer! (get-in chans [sock-id :ctl-out]) res))
-                (catch Exception e
-                  (error "*ERROR* when executing a command: %s" e)))
-              (recur socks chans)
-              )
-
-            [[sock-id msg-out]]
-            (do
-              (trace "zmq-poller: sending message to %s" sock-id)
-              (try
-                (send! (socks sock-id) msg-out)
-                (catch Exception e
-                  (error "*ERROR* when sending a message: %s" e)))
-              (recur socks chans)
-              )
+          [[:command sock-id cmd]]
+          (do
+            (trace "zmq-poller: commanding %s" sock-id)
+            (try
+              ;; Execute cmd with socket corresponding to sock-id and
+              ;; when return value is non-nil return it to async-control-chan
+              ;; for further processing.
+              (when-let [res (cmd (socks sock-id))]
+                (offer! (get-in chans [sock-id :ctl-out]) res))
+              (catch Exception e
+                (error "*ERROR* when executing a command: %s" e)))
+            (recur socks chans)
             )
-           )
 
-         [:injector :shutdown]
-         (do
-           (trace "zmq-poller: shutting down context...")
-           ;; - Sets linger on all sockets to 0 (by default) and closes them.
-           ;; - Removes sockets from the context.
-           ;; - Terminates the underlying context.
-           ;; - If linger of zctx is > 0, may block if any sockets
-           ;;   (even closed) have pending operations.
-           ;; - Linger values on individual sockets are not respected.
-           ;;(doseq [s socks] (.destroySocket zctx s))
-           (.destroy zctx)
-           ;; Close chans.
-           (trace "zmq-poller: closing chans...")
-           (doseq [c (->> (vals chans)
-                          (map #(vals %))
-                          flatten)] (close! c)))
+          [[sock-id msg-out]]
+          (do
+            (trace "zmq-poller: sending message to %s" sock-id)
+            (try
+              (send! (socks sock-id) msg-out)
+              (catch Exception e
+                (error "*ERROR* when sending a message: %s" e)))
+            (recur socks chans)
+            )
+          )
+         )
 
-         [:injector invalid]
-         (throw (RuntimeException. (str "Invalid injection message: " invalid)))
+       [:injector :shutdown]
+       (do
+         (trace "zmq-poller: shutting down context...")
+         (trace "zmq-poller: closing chans...")
+         (doseq [c (->> (vals chans)
+                        (map #(vals %))
+                        flatten)] (close! c))
+         (>!! zmqt-term (vals socks)))
 
-         [sock-id msg-in]
-         (do
-           (trace "zmq-poller: incoming message on %s" sock-id)
-           (offer! (get-in chans [sock-id :out]) msg-in)
-           (recur socks chans)
-           )
-         ))
-      )
-    )
-  (trace "zmq-poller: terminated")
-  )
+       ;; Blows up and leaves resources open. This should never happen.
+       [:injector invalid]
+       (throw (RuntimeException. (str "Invalid injection message: " invalid)))
+
+       [sock-id msg-in]
+       (do
+         (trace "zmq-poller: incoming message on %s" sock-id)
+         (offer! (get-in chans [sock-id :out]) msg-in)
+         (recur socks chans)))))
+  
+  (trace "zmq-poller: terminated"))
 
 (defn- sock-id-for-chan
   [c pairings]
   (first (for [[id chans] pairings :when ((set (vals chans)) c)] id)))
 
-(defn- injector [zctx internal-addr internal-chan ctl-chan]
-  (let [injector (doto (.createSocket zctx (socket-types :push))
-                   (.connect internal-addr))
-        inject-msg!  (fn [msg]
+(defn- injector [injector internal-chan ctl-chan injt-term]
+  (let [inject-msg!  (fn [msg]
                        (send! injector "message")
                        (>!! internal-chan msg))
         sock-num (volatile! 0)
@@ -199,16 +190,14 @@
                   (format "%s-%s-%d"
                           (last (split (thread-name) #"-"))
                           (str (get (map-invert socket-types) (.getType sock)))
-                          (vswap! sock-num inc)))
-        ]
+                          (vswap! sock-num inc)))]
     (trace "injector: %s started" (thread-name))
     (loop [chans {:control {:in ctl-chan}}]
       (let [in-chans (->> (vals chans)
                           (map #(vals %))
                           flatten)
             [val c] (alts!! in-chans)
-            id (sock-id-for-chan c chans)
-            ]
+            id (sock-id-for-chan c chans)]
         (match
          [id val]
 
@@ -253,21 +242,43 @@
              (inject-msg! [:command id msg])
 
              :else
-             (throw (RuntimeException. "This should never happen."))
-             )
+             (throw (RuntimeException. "This should never happen.")))
            (recur chans))))))
-  
+  (close! injt-term)
   (trace "injector: terminated"))
+
+(defn context-alive [ctx]
+  (let [{:keys [zmq-thread injector-thread]} ctx]
+    (and (.isAlive injector-thread) (.isAlive zmq-thread))))
 
 (defn init-context!
   [ctx]
   (let [{:keys [zmq-thread injector-thread]} ctx]
-    (if (.isAlive injector-thread)
+    (if (context-alive ctx)
       false
       (do
         (.start injector-thread)
         (.start zmq-thread)
         true))))
+
+
+(defn- bind-rand-port!
+  ([sock addr] (bind-rand-port! sock addr 30000))
+  ([sock addr timeout-ms]
+   (loop []
+     (when-let [e (try (.bind sock (str addr ":*")) (catch ZMQException e e))]
+       ;; Wait for the OS to release some of the previously bound ports.
+       (Thread/sleep timeout-ms)
+       (recur)))
+   (let [bound-port (-> (.getLastEndpoint sock)
+                        String.
+                        (split #":")
+                        last
+                        butlast
+                        into-array
+                        join
+                        Long/parseLong)]
+     bound-port)))
 
 (defn context
   "Create a context.
@@ -282,49 +293,62 @@
   ([] (context nil))
   ([name] (context name 1))
   ([name io-threads]
-   (let [injection-addr  (str "ipc://injection-" (gensym (or name "")))
+   (let [inj-addr        (str "inproc://injection-" (gensym (or name "")))
          name            (or name (gensym "context"))
-         zcontext        (doto (ZContext.)
-                           (.setIoThreads io-threads)
-                           (.setMain true) ; causes ZMQ$Context to term
-                           )
+         internal-ctx    (ZMQ/context io-threads)
          internal-chan   (chan)
-                         
-         ctl-chan        (chan) 
-         injector-thread (doto (Thread.
-                                #(injector zcontext injection-addr
-                                           internal-chan ctl-chan))
+         ctl-chan        (chan)
+         zmqt-term       (chan 1)
+         injt-term       (chan 1)
+         injector-out    (doto (.socket internal-ctx ZMQ/PULL) (.bind inj-addr))
+         injector-in     (doto (.socket internal-ctx ZMQ/PUSH) (.connect inj-addr))
+         injector-thread (doto (Thread. #(injector injector-in
+                                                   internal-chan
+                                                   ctl-chan
+                                                   injt-term))
                            (.setName (format "injector-%s" name))
                            (.setDaemon true))
          zmq-thread      (doto (Thread.
-                                #(zmq-poller zcontext injection-addr
-                                             internal-chan))
+                                #(zmq-poller injector-out
+                                             internal-chan
+                                             zmqt-term))
                            (.setName (format "zmq-poller-%s" name))
                            (.setDaemon true))
-         shutdown        (fn [] (close! ctl-chan))
-         ]
-     {:zcontext        zcontext
-      :name            name
-      :ctl-chan        ctl-chan
-      :addr            injection-addr
-      :injector-thread injector-thread
-      :zmq-thread      zmq-thread
-      :shutdown        shutdown}
-     )))
+         ctx             {:internal-ctx    internal-ctx
+                          :name            name
+                          :ctl-chan        ctl-chan
+                          :injector-thread injector-thread
+                          :zmq-thread      zmq-thread}
+         ;; Returns true on successful shutdown, otherwise nil.
+         shutdown        (fn []
+                           ;; It is safe to call :shutdown more than once.
+                           (when (context-alive ctx)
+                             (close! ctl-chan)
+                             (<!! injt-term)
+                             (let [sockets (<!! zmqt-term)]
+                               (doseq [sock sockets] (.close sock)))
+                             ;; It is OK to .close a ZMQ$Socket/ZMQ$Context
+                             ;; multiple times.
+                             (.close injector-out)
+                             (.close injector-in)
+                             (.close internal-ctx)
+                             true))]
+     (assoc ctx :shutdown shutdown))))
 
 ;; One io-thread should be sufficient almost always.
 (def default-context (context "default-context" 1))
 
 (def type-bytes (type (byte-array [])))
 
-(defn get-bytes [x]
+(defn- get-bytes [x]
   (if (instance? type-bytes x) x (.getBytes x)))
 
 (defn gen-socket-configurator [opts]
   (fn [socket]
     (let [{:keys [bind connect plain-user plain-pass plain-server
                   zap-domain req-retry id send-hwm recv-hwm
-                  subscribe]} opts]
+                  subscribe]} opts
+          res                 (transient {})]
       (when id (.setIdentity socket (get-bytes id)))
       (when zap-domain (.setZAPDomain (get-bytes zap-domain)))
       (when (or plain-server plain-user plain-pass)
@@ -338,18 +362,22 @@
       (when req-retry
         (.setReqRelaxed socket req-retry)
         (.setReqCorrelate socket req-retry))
-      ;; (when plain-user
-      ;;   (assert (and (coll? plain) (= (count plain) 2))
-      ;;           "Specify :plain-user in form [username password]")
-      ;;   (.setPlainUsername s (.getBytes (first plain)))
-      ;;   (.setPlainPassword s (.getBytes (second plain)))
-      ;;   )
       (when send-hwm (.setSndHWM socket send-hwm))
       (when recv-hwm (.setRcvHWM socket recv-hwm))
       (assert (or bind connect) "Specify :bind or :connect.")
-      (when bind (.bind socket bind))
+      (when bind
+        (.bind socket bind)
+        (when (re-matches #"tcp://.*:\*" bind)
+          (assoc! res :bound-port (-> (.getLastEndpoint socket)
+                                      String.
+                                      (split #":")
+                                      last
+                                      butlast
+                                      into-array
+                                      join))))
       (when connect (.connect socket connect))
-      (when subscribe (.subscribe socket (get-bytes subscribe))))))
+      (when subscribe (.subscribe socket (get-bytes subscribe)))
+      (persistent! res))))
 
 (defn socket [socket-type & opts]
   (let [opts         (if (map? opts) opts (apply hash-map (apply vector opts)))
@@ -358,22 +386,14 @@
         out          (or (opts :out) (chan 1))
         ctl-in       (or (opts :ctl-in) (chan))
         ctl-out      (or (opts :ctl-out) (chan 1))
+        _            (assert (and in out ctl-in ctl-out) "missing channels")
         ctx          (or (opts :context) default-context)
         initialized  (try (init-context! ctx)
-                                (catch java.lang.IllegalThreadStateException e
-                                  (throw (IllegalArgumentException.
-                                          "Context is terminated"))))]
-    (let [socket (.createSocket (ctx :zcontext) (socket-types socket-type))]
-      (assert (and in out ctl-in ctl-out) "missing channels")
-      (configurator socket)
-      (>!! (ctx :ctl-chan)
-           [:register socket {:in in :out out :ctl-in ctl-in :ctl-out ctl-out}])
-      {:in in :out out :ctl-in ctl-in :ctl-out ctl-out}
-      )))
-
-(comment
-  
-  )
-
-
-
+                          (catch java.lang.IllegalThreadStateException e
+                            (throw (IllegalArgumentException.
+                                    "Context is terminated"))))
+        socket       (.socket (ctx :internal-ctx) (socket-types socket-type))
+        info         (configurator socket)]
+    (>!! (ctx :ctl-chan)
+         [:register socket {:in in :out out :ctl-in ctl-in :ctl-out ctl-out}])
+    {:in in :out out :ctl-in ctl-in :ctl-out ctl-out :info info}))
