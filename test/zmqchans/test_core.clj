@@ -1,6 +1,7 @@
 (ns zmqchans.test-core
   (:use
    [zmqchans.core]
+   [zmqchans.utils]
    [clojure.test])
   (:require
    [clojure.core.async :refer
@@ -9,6 +10,9 @@
    [clojure.set :refer [map-invert]]
    )
   )
+
+(defn get-pid []
+  (-> (java.lang.management.ManagementFactory/getRuntimeMXBean) .getName))
 
 (defn run-with-timeout
   "Run a function on another thread with maximum execution duration.
@@ -102,16 +106,7 @@
                     )
                   )]
          (def ~(vary-meta name assoc :test f)
-           (fn [] (test-var (var ~name))))
-         ))))
-
-(defn get-free-port []
-  (with-open [ss (java.net.ServerSocket. 0)]
-    (.getLocalPort ss)))
-
-(defn rand-tcp-addr []
-  (let [port (get-free-port)]
-    [(str "tcp://*:" port) (str "tcp://localhost:" port)]))
+           (fn [] (test-var (var ~name))))))))
 
 (defn random-socket [ctx]
   ;; :router and :rep trigger a bug in libzmq
@@ -122,26 +117,17 @@
           (rand-nth [:bind :connect])
           (str (gensym "ipc://test-random-socket-"))))
 
-(defn ctx-terminated? [ctx]
-  (is (not (.isAlive (:zmq-thread ctx))))
-  (is (not (.isAlive (:injector-thread ctx))))
-  (is (= (count (.getSockets (ctx :zcontext))) 0)))
-
 (deftest-with-timeout startup-shutdown 1000
   (let [n       100 ; too high n and inproc runs out of fds
         ctx     (context)
         sockets (vec (take n (repeatedly #(random-socket ctx))))]
-    (is (.isAlive (ctx :zmq-thread)))
-    (is (.isAlive (ctx :injector-thread)))
-    (is (= (count (.getSockets (ctx :zcontext))) (+ n 2)))
+    (is (context-alive ctx))
     ((ctx :shutdown))
-    ;; need some time to shut down...
-    (Thread/sleep 100)
-    (ctx-terminated? ctx)))
+    (is (not (context-alive ctx)))))
 
 (deftest-with-timeout deadlock-seeker 2000
   (let [ctx  (context)
-        addr (str (gensym "ipc://test-deadlock-seeker-"))
+        addr (str (gensym "inproc://test-deadlock-seeker-"))
         pub  (socket :pub :context ctx :bind addr)
         n-sub 10
         subs (for [i (range n-sub)]
@@ -190,8 +176,7 @@
 
 (deftest-with-timeout ping-pong 1000
   (let [ctx   (context)
-        addr  (str (gensym "ipc://test-ping-pong"))
-        ;; [b-addr c-addr] (rand-tcp-addr)
+        addr  (str (gensym "inproc://test-ping-pong-"))
         rep   (socket :rep :context ctx :bind addr)
         req   (socket :req :context ctx :connect addr)
         n     1000
@@ -215,27 +200,162 @@
         ]
     (is (= (min rep-r req-r) n))
     (is (= (Math/abs (- rep-r req-r)) 1))
-    (Thread/sleep 100) ; wait for a while for sockets to close
-    (is (= 2 (count (.getSockets (ctx :zcontext))))) ; only internal sockets
-    ((ctx :shutdown))
-    ))
+    ((ctx :shutdown))))
 
-;; (deftest-with-timeout big-file-one-ctx 10000
-;;   (let [ctx (context)
-;;         [b-addr c-addr] (rand-tcp-addr)
-        
+(defmacro timed-run-ms [& forms]
+  `(let [start-time# (System/nanoTime)
+         res# (do ~@forms)
+         end-time# (System/nanoTime)]
+     [res# (double (/ (- end-time# start-time#) 1e6))]))
 
-;;         ])
-;;   )
+;; If one context is processing huge messages, it's more efficient to transfer
+;; smaller messages in another context.
+(deftest-with-timeout big-packets 10000
+  (letfn
+      [(run-test! [ctx1 ctx2 data-mibs n]
+         (let [data-b (byte-array (* 1024 1024 data-mibs))
+               len-b  n
+               addr-b (str (gensym "inproc://test-big-file-big-"))
+               addr-s (str (gensym "inproc://test-big-file-small-"))
+               pull-b (socket :pull :context ctx1 :bind addr-b)
+               push-b (socket :push :context ctx1 :connect addr-b)
+               pull-s (socket :pull :context ctx2 :bind addr-s)
+               push-s (socket :push :context ctx2 :connect addr-s)
+               exprom (promise-chan)
+               res-b  (thread
+                        (loop [i 1]
+                          ;;(println "BIG start" i)
+                          (>!! (push-b :in) data-b)
+                          (<!! (pull-b :out))
+                          ;;(println "BIG end" i)
+                          (if (and (< i len-b) (not (poll! exprom)))
+                            (recur (inc i))
+                            (do (>!! exprom :exit) i))))
+               res-s  (thread
+                        (loop [i 1]
+                          (>!! (push-s :in) "")
+                          (<!! (pull-s :out))
+                          ;;(println i)
+                          (if (not (poll! exprom))
+                            (recur (inc i))
+                            i)))]
+           (let [res (try [(<!! res-b) (<!! res-s)]
+                          (catch java.lang.InterruptedException e
+                            (>!! exprom :exit)))]
+             ((ctx1 :shutdown))
+             ((ctx2 :shutdown))
+             res)))]
+    (let [;; single context
+          ctx (context)
+          [[b1 s1] ms1]    (timed-run-ms (run-test! ctx ctx 100 5))
+          perf1 (/ s1 ms1)
+          ;; two contexts
+          [[b2 s2] ms2]    (timed-run-ms (run-test! (context) (context) 100 5))
+          perf2 (/ s2 ms2)]
+      ;;(println perf1 perf2)
+      (is (> perf2 perf1)))))
+
+;; ;; If one context is processing huge messages, it's more efficient to transfer
+;; ;; smaller messages in another context.
+;; (deftest-with-timeout big-packets 100000000
+;;   (letfn
+;;       [(run-test! [ctx1 ctx2 data-mibs n]
+;;          (let [data-b (byte-array (* 1024 1024 data-mibs))
+;;                len-b  n
+;;                addr-b (str (gensym "inproc://test-big-file-big-"))
+;;                addr-s (str (gensym "inproc://test-big-file-small-"))
+;;                pull-b (socket :pull :context ctx1 :bind addr-b)
+;;                push-b (socket :push :context ctx1 :connect addr-b)
+;;                pull-s (socket :pull :context ctx2 :bind addr-s)
+;;                push-s (socket :push :context ctx2 :connect addr-s)
+;;                exprom (promise-chan)
+;;                res-b  (thread
+;;                         (loop [i 1]
+;;                           ;;(println "BIG start" i)
+;;                           (>!! (push-b :in) data-b)
+;;                           (<!! (pull-b :out))
+;;                           ;;(println "BIG end" i)
+;;                           (if (and (< i len-b) (not (poll! exprom)))
+;;                             (recur (inc i))
+;;                             (do (>!! exprom :exit) i))))
+;;                res-s  (thread
+;;                         (loop [i 1]
+;;                           (>!! (push-s :in) "")
+;;                           (<!! (pull-s :out))
+;;                           ;;(println i)
+;;                           (if (not (poll! exprom))
+;;                             (recur (inc i))
+;;                             i)))]
+;;            (let [res (try [(<!! res-b) (<!! res-s)]
+;;                           (catch java.lang.InterruptedException e
+;;                             (>!! exprom :exit)))]
+;;              ((ctx1 :shutdown))
+;;              ((ctx2 :shutdown))
+;;              res)))]
+;;     (loop [i 0]
+;;       (let [start-time (java.util.Date.)
+;;             ctx     (context)
+;;             ;; single context
+;;             [b1 s1] (run-test! ctx ctx 10 1)
+;;             _ (println (float (/ s1 (- (.getTime (java.util.Date.))
+;;                                        (.getTime start-time)))))
+;;             ;; two contexts
+;;             start-time (java.util.Date.)
+;;             [b2 s2] (run-test! (context) (context) 10 1)]
+;;         (is (> s2 s1))
+;;         (println i s1 s2 (float (/ s2 (- (.getTime (java.util.Date.))
+;;                                          (.getTime start-time)))) "\n")
+;;         (recur (inc i))
+;;         ))))
 
 
 
+;; (deftest-with-timeout context-creator 100000000
+;;   (println (get-pid))
+;;   (loop [i 0]
+;;     (let [ctx (context)
+;;           ;;sock (random-socket ctx)
+;;           ]
+;;       (init-context! ctx)
+;;       ((ctx :shutdown))
+;;       ;;(.destroy (ctx :zcontext))
+;;       ;;(Thread/sleep 10)
+;;       (printf "\r%d" i)
+;;       (flush)
+;;       (recur (inc i))
+;;       )))
 
 
-
-
-
-
+;; (deftest-with-timeout context-creator 100000000
+;;   (println (get-pid))
+;;   (loop [i 0]
+;;     (let [zctx (org.zeromq.ZContext.)
+;;           [addr-b addr-c] (first (rand-tcp-addr 1))
+;;           push (thread
+                 
+;;                  (doto (.createSocket zctx (socket-types :push))
+;;                          (.connect addr-c)))
+;;           pull (thread
+;;                  (Thread/sleep 10)
+;;                  (doto (.createSocket zctx (socket-types :pull))
+;;                          (.bind addr-b)))
+;;           c (chan 1)
+;;           t (java.lang.Thread. (fn []
+;;                                  (printf "\rT: %d" (<!! c))
+;;                                  (flush)))]
+;;       (<!! push)
+;;       (<!! pull)
+;;       ;;(Thread/sleep 10)
+;;       (.destroy zctx)
+;;       (.setDaemon t true)
+;;       (.start t)
+;;       (>!! c i)
+;;       ;;(close! c)
+;;       ;;(Thread/sleep 100)
+;;       ;;(printf "\r%d" i)
+;;       ;;(flush)
+;;       (recur (inc i))
+;;       )))
 
 
 
