@@ -30,7 +30,7 @@
   (let [n       100 ; too high n and inproc runs out of fds
         ctx     (context)
         sockets (vec (take n (repeatedly #(random-socket ctx))))]
-    (is (context-alive ctx))
+    (is (context-alive? ctx))
     (terminate! ctx)
     (is (terminated? ctx))))
 

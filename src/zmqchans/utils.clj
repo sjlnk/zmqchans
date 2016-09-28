@@ -194,3 +194,11 @@
 
 (def decode-str
   (xform-base #(String. %)))
+
+(defmacro with-temp-context
+  "Execute body with temporary context bound to *context*.
+  Combines `with-open` and `binding` statements."
+  [& body]
+  `(with-open [ctx# (zmqchans.core/context)]
+     (binding [zmqchans.core/*context* ctx#]
+       ~@body)))
