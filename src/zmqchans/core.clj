@@ -196,7 +196,7 @@
   (>!! injt-term :terminated)
   (trace "injector: terminated"))
 
-(defn context-alive [ctx]
+(defn context-alive? [ctx]
   (let [{:keys [zmq-thread injector-thread]} ctx]
     (and (.isAlive injector-thread) (.isAlive zmq-thread))))
 
@@ -209,7 +209,7 @@
     (fn [ctx]
       (locking locker
         (let [{:keys [zmq-thread injector-thread]} ctx]
-          (if (context-alive ctx)
+          (if (context-alive? ctx)
             false
             (do
               (.start zmq-thread)
@@ -272,7 +272,7 @@
          ;; Returns true on successful shutdown, otherwise nil.
          shutdown        (fn []
                            ;; It is safe to call :shutdown more than once.
-                           (when (context-alive ctx)
+                           (when (context-alive? ctx)
                              (close! ctl-chan)
                              (<!! injt-term)
                              (let [sockets (<!! zmqt-term)]

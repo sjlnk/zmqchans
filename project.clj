@@ -1,4 +1,4 @@
-(defproject zmqchans "0.3.0"
+(defproject zmqchans "0.3.1"
   :description "A bridge between ZeroMQ sockets and core.async"
   :url "https://github.com/sjlnk/zmqchans"
   :license {:name "Eclipse Public License"
