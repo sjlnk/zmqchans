@@ -3,6 +3,7 @@
 /checkouts
 /dev
 /lib
+/vendor/jzmq
 pom.xml
 pom.xml.asc
 *.jar

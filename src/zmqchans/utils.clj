@@ -11,7 +11,7 @@
     :refer [chan  close! go thread <! >! <!! >!! alts!! timeout offer!
             poll! pipe]])
   (:import
-   [org.zeromq ZContext ZMQ ZMQ$Poller ZMQ$Socket]
+   [org.zeromq ZMQ ZMQ$Poller ZMQ$Socket]
    [zmqchans.common Socket Context]
    ))
 
