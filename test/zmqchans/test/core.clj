@@ -32,6 +32,7 @@
         sockets (vec (take n (repeatedly #(random-socket ctx))))]
     (is (context-alive? ctx))
     (terminate! ctx)
+    (Thread/sleep 100)
     (is (terminated? ctx))))
 
 (deftest-with-timeout deadlock-seeker 4000
@@ -186,6 +187,7 @@
       (doseq [[i p] pubs] (send! p (str i)))
       (doseq [tc s-term] (<!! tc)))
     (terminate! *context*)
+    (Thread/sleep 100)
     (is (terminated? *context*))))
 
 (deftest-with-timeout proxy-chain 5000
