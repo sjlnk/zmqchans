@@ -1,4 +1,4 @@
-(defproject zmqchans/zmqchans "0.3.2-SNAPSHOT"
+(defproject zmqchans/zmqchans "0.3.2"
   :description "Thread-safe Clojure core.async interface to ZeroMQ"
   :url "https://github.com/sjlnk/zmqchans"
   :license {:name "Eclipse Public License"
