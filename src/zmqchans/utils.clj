@@ -29,7 +29,7 @@
   (and (= java.lang.Thread$State/TERMINATED
           (.getState (:zmq-thread ctx)))
        (= java.lang.Thread$State/TERMINATED
-          (.getState (:injector-thread ctx)))))
+          (.getState (:inj-thread ctx)))))
 
 (defn command!
   "Generic way to manipulate a socket. You can use any user defined function

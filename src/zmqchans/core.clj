@@ -41,7 +41,7 @@
   "A loop that handles all the interaction with ZMQ Sockets. This library
   is thread safe because all the ZMQ socket manipulation happens on this
   loop that is ran from a single thread."
-  [injector internal-chan zmqt-term]
+  [injector internal-chan zmq-term]
   
   (trace "zmq-poller: %s started" (thread-name))
   (loop [socks {:injector injector}, chans {}]
@@ -104,7 +104,7 @@
          (doseq [c (->> (vals chans)
                         (map #(vals %))
                         flatten)] (close! c))
-         (>!! zmqt-term (vals socks)))
+         (>!! zmq-term (vals socks)))
 
        ;; Blows up and leaves resources open. This should never happen.
        [:injector invalid]
@@ -127,10 +127,10 @@
   with ZMQ poller thread. All input to ZMQ poller thread is injected from this
   thread. Injector has access to one ZMQ socket that sends a signal message
   to ZMQ loop. The real data is transmitted using channels."
-  [injector internal-chan ctl-chan injt-term]
+  [inj-sock internal-chan ctl-chan inj-term]
   
   (let [inject-msg!  (fn [msg]
-                       (send! injector "message")
+                       (send! inj-sock "message")
                        (>!! internal-chan msg))
         sock-num (volatile! 0)
         gen-id  (fn [sock]
@@ -163,7 +163,7 @@
          (do
            (trace "injector: shutting down context...")
            (doseq [c in-chans] (close! c))
-           (send! injector "shutdown"))
+           (send! inj-sock "shutdown"))
 
          [:control invalid]
          (throw (RuntimeException. (str "Invalid control message: " invalid)))
@@ -193,12 +193,12 @@
              :else
              (throw (RuntimeException. "This should never happen.")))
            (recur chans))))))
-  (>!! injt-term :terminated)
+  (>!! inj-term :terminated)
   (trace "injector: terminated"))
 
 (defn context-alive? [ctx]
-  (let [{:keys [zmq-thread injector-thread]} ctx]
-    (and (.isAlive injector-thread) (.isAlive zmq-thread))))
+  (let [{:keys [zmq-thread inj-thread]} ctx]
+    (and (.isAlive inj-thread) (.isAlive zmq-thread))))
 
 (def init-context!
   "Initialize a Context. Starts the underlying threads and starts consuming
@@ -208,12 +208,12 @@
   (let [locker (Object.)]
     (fn [ctx]
       (locking locker
-        (let [{:keys [zmq-thread injector-thread]} ctx]
+        (let [{:keys [zmq-thread inj-thread]} ctx]
           (if (context-alive? ctx)
             false
             (do
               (.start zmq-thread)
-              (.start injector-thread)
+              (.start inj-thread)
               true)))))))
 
 (defn context
@@ -221,7 +221,7 @@
   
   Create a context that serves as a structure to hold together all the data
   related to running zmqchans. Contains references to the underlying constructs
-  like zmq-thread and injector-thread. Manages lifetime of the objects polled
+  like zmq-thread and inj-thread. Manages lifetime of the objects polled
   inside zmq-thread. All the resources will be closed upon termination of
   the context.
 
@@ -237,56 +237,56 @@
   ([] (context nil))
   ([name] (context name 1))
   ([name io-threads]
+   ;; inj is a shorthand for injector
    (let [inj-addr        (str "inproc://injection-" (gensym (or name "")))
          name            (or name (gensym "context"))
          internal-ctx    (ZMQ/context io-threads)
          internal-chan   (chan)
          ctl-chan        (chan)
-         zmqt-term       (promise-chan)
-         injt-term       (promise-chan)
-         injector-out    (doto (.socket internal-ctx ZMQ/PULL)
+         zmq-term        (promise-chan)
+         inj-term        (promise-chan)
+         inj-sock-out    (doto (.socket internal-ctx ZMQ/PULL)
                            (.bind inj-addr))
-         ;;_               (Thread/sleep 10)
-         injector-in     (doto (.socket internal-ctx ZMQ/PUSH)
+         inj-sock-in     (doto (.socket internal-ctx ZMQ/PUSH)
                            ;; Don't send messages until connection is finished.
                            ;; TODO: Investigate if this is necessary.
                            (.setImmediate true)
                            (.connect inj-addr))
-         injector-thread (doto (Thread. #(injector injector-in
+         inj-thread (doto (Thread. #(injector inj-sock-in
                                                    internal-chan
                                                    ctl-chan
-                                                   injt-term))
+                                                   inj-term))
                            (.setName (format "injector-%s" name))
                            (.setDaemon true))
          zmq-thread      (doto (Thread.
-                                #(zmq-poller injector-out
+                                #(zmq-poller inj-sock-out
                                              internal-chan
-                                             zmqt-term))
+                                             zmq-term))
                            (.setName (format "zmq-poller-%s" name))
                            (.setDaemon true))
-         ctx             {:internal-ctx    internal-ctx
-                          :name            name
-                          :ctl-chan        ctl-chan
-                          :injector-thread injector-thread
-                          :zmq-thread      zmq-thread}
+         ctx             {:internal-ctx internal-ctx
+                          :name         name
+                          :ctl-chan     ctl-chan
+                          :inj-thread   inj-thread
+                          :zmq-thread   zmq-thread}
          ;; Returns true on successful shutdown, otherwise nil.
          shutdown        (fn []
                            ;; It is safe to call :shutdown more than once.
                            (when (context-alive? ctx)
                              (close! ctl-chan)
-                             (<!! injt-term)
-                             (let [sockets (<!! zmqt-term)]
+                             (<!! inj-term)
+                             (let [sockets (<!! zmq-term)]
                                (doseq [sock sockets] (.close sock)))
                              ;; It is OK to .close a ZMQ$Socket/ZMQ$Context
                              ;; multiple times.
-                             (.close injector-out)
-                             (.close injector-in)
+                             (.close inj-sock-out)
+                             (.close inj-sock-in)
                              (.close internal-ctx)
                              true))]
      ;; Buffer size of 1 is ideal for signaling.
      (when (min-zmq-version 4 0 0)
-       (.setConflate injector-out true)
-       (.setConflate injector-in true))
+       (.setConflate inj-sock-out true)
+       (.setConflate inj-sock-in true))
      (map->Context (assoc ctx :shutdown shutdown)))))
 
 
@@ -303,20 +303,47 @@
   opts        - Optional options
 
   Optional options:
-  First opt can be string defining `attach!` addresses (comma separated).
+
+  First opt can be string defining `attach!` addresses or it can be omitted.
+  Attach addresses are either binds (prefix '@') or connects (prefix '>'),
+  just like in official CZMQ bindings. You can define many attach addresses
+  in a string form separated by commas (CZMQ style) or as a collection.
+
   After that:
   :context - Context to use instead of default, overrides *context*.
-  :eps     - Alternative way to define `attach!` addresses.
   :bind    - Addresses to bind to (string or coll of strings)
   :connect - Addresses to connect to (string or coll of strings)
+  :attach  - Alternative location to input `attach` addresses.
   :in      - Custom channel for input (default: (chan))
   :out     - Custom channel for output (default: (chan 1000))
+
+  Opts can be passed as a map as well.
 
   Defining custom input channel is useful if you want to use a transducer.
   Defining custom output channel is useful if you want to use a transducer
   or custom buffering behavior.
 
   Initializes a context if necessary.
+
+  Examples:
+
+  ;; Create a :router socket and bind to random tcp port, for all ip-addresses.
+  (socket :router \"@tcp://*:*\")
+  ;; or
+  (socket :router :bind \"tcp://*:*\")
+  
+  ;; Create a :dealer socket and connect to ipc address \"foo\".
+  (socket :dealer \">ipc://foo\")
+  ;; or
+  (socket :dealer :connect \"ipc://foo\")
+
+  ;; Create a :pull socket and bind to two addresses.
+  (socket :pull \"@inproc://foo,@inproc://bar\")
+  ;; or
+  (socket :pull :bind [\"inproc://foo\" \"inproc://bar\"])
+
+  ;; Create a :sub socket and connect + subscribe to everything
+  (socket :sub \">ipc://publisher\" :subscribe \"\")
   "
   [socket-type & opts]
   (let [[opts eps] (if (string? (first opts))
@@ -324,7 +351,7 @@
                      [opts nil])
         opts       (if (map? opts) opts (apply hash-map (apply vector opts)))
         ctx        (if (:context opts) (:context opts) *context*)
-        eps        (or eps (:eps opts))
+        eps        (or eps (:attach opts))
         eps        (if eps
                      (if (coll? eps) eps (split eps #","))
                      [])
@@ -346,8 +373,6 @@
         out        (or (:out opts) (if (= socket-type :push)
                                      nil
                                      (chan 1000)))
-        ;; ctl-in     (or (:ctl-in opts) (chan))
-        ;; ctl-out    (or (:ctl-out opts) (chan 1))
         ;; No good reason to customize ctl-in / ctl-out channels.
         ctl-in     (chan)
         ctl-out    (chan 1)
@@ -357,9 +382,6 @@
                          (catch java.lang.IllegalThreadStateException e
                            (throw (IllegalArgumentException.
                                    "Context is terminated"))))
-        ;; This might prevent some extremely rare deadlocks from happening.
-        ;; TODO: investigate if really needed and why exactly.
-        _           (when initialized (Thread/sleep 10))
         socket-r    (.socket (:internal-ctx ctx) (socket-types socket-type))
         socket      (map->Socket {:in    in       :out out :ctl-in
                                   ctl-in :ctl-out ctl-out})]

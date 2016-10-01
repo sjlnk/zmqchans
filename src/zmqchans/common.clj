@@ -33,7 +33,7 @@
   (close [this] (close! (:in this))))
 
 (defrecord Context [internal-ctx name ctl-chan
-                    injector-thread zmq-thread shutdown]
+                    inj-thread zmq-thread shutdown]
   java.io.Closeable
   (close [this] ((:shutdown this))))
 

@@ -16,6 +16,11 @@
    )
   )
 
+;; Many of these tests are trying induce deadlocks. Some tests
+;; don't have many explicit "is" statements because there is not much
+;; to check. These tests have a timeout limit: they must not freeze
+;; or they will fail an implicit "is" statement.
+
 (defn random-socket [ctx]
   ;; :router and :rep trigger a bug in libzmq
   ;; when connecting without binding first.
@@ -52,9 +57,11 @@
                   (loop []
                     (when-not (poll! ex-prom)
                       (send! req "ping?")
-                      (assert (= (String. (recv! rep)) "ping?"))
+                      (when-let [msg (recv! rep)]
+                        (assert (= (String. msg) "ping?")))
                       (send! rep "pong!")
-                      (assert (= (String. (recv! req)) "pong!"))
+                      (when-let [msg (recv! req)]
+                        (assert (= (String. msg) "pong!")))
                       (swap! tstamps #(assoc % :pp (java.util.Date.)))
                       (recur))))
         pub-term (thread
