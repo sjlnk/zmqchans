@@ -139,13 +139,13 @@
   (loop [res []]
     (if-let [data (try-recv! sock)] (recur (conj res data)) res)))
 
-(defn setid!
+(defn set-id!
   "Set `ZMQ_IDENTITY` of a socket."
   [sock id]
   (let [id (get-bytes id)]
     (command! sock #(.setIdentity % id))))
 
-(defn getid
+(defn get-id
   "Get `ZMQ_IDENTITY` of a socket."
   [sock] (command! sock #(.getIdentity %)))
 

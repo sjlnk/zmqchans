@@ -15,7 +15,7 @@ Improvements over `zmq-async`:
 ## Installation
 
 ```clj
-[zmqchans "0.3.3"]
+[zmqchans "0.3.4"]
 ```
 
 If you are using linux with x86_64 architecture that's all you need to do. The artifact comes with cljzmq and libzmq deployed in a .jar file. For information about the exact binary versions, please refer to [project.clj](https://github.com/sjlnk/zmqchans/blob/master/project.clj).
